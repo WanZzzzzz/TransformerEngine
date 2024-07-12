@@ -80,6 +80,7 @@ class VectorizedAccessor {
       alignment_ = 0;
       aligned_ptr_ = reinterpret_cast<LType *>(ptr);
       n_elems_ = (size + nvec - 1) / nvec;
+      std::cout << "aligned, nvect is " << nvec << std::endl;
     } else {
       size_t ptr_as_number = reinterpret_cast<size_t>(ptr);
       alignment_ = (ptr_as_number % sizeof(LType)) / sizeof(DType);
