@@ -8,7 +8,7 @@
 #define TRANSFORMER_ENGINE_COMMON_UTIL_VECTORIZED_POINTWISE_H_
 
 #include <type_traits>
-
+#include <iostream>
 #include "../common.h"
 #include "../utils.cuh"
 
