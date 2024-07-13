@@ -8,7 +8,7 @@
 #define TRANSFORMER_ENGINE_COMMON_UTIL_VECTORIZED_POINTWISE_H_
 
 #include <type_traits>
-#include <iostream>
+
 #include "../common.h"
 #include "../utils.cuh"
 
@@ -80,12 +80,13 @@ class VectorizedAccessor {
       alignment_ = 0;
       aligned_ptr_ = reinterpret_cast<LType *>(ptr);
       n_elems_ = (size + nvec - 1) / nvec;
-      std::cout << "aligned, nvect is " << nvec << std::endl;
+      printf("Debug: nvec = %d\n", nvec);
     } else {
       size_t ptr_as_number = reinterpret_cast<size_t>(ptr);
       alignment_ = (ptr_as_number % sizeof(LType)) / sizeof(DType);
       aligned_ptr_ = reinterpret_cast<LType *>(ptr - alignment_);
       n_elems_ = (size + alignment_ + nvec - 1) / nvec;
+      printf("not aligned: nvec = %d\n", nvec);
     }
   }
 
@@ -171,6 +172,7 @@ __launch_bounds__(unary_kernel_threads) __global__
     void unary_kernel(const InputType *input, OutputType *output, const ComputeType *scale,
                       ComputeType *amax, Param p, const size_t N,
                       const size_t num_aligned_elements) {
+  printf("Debug: N = %d\n", N);
   VectorizedLoader<InputType, nvec, aligned> loader(input, N);
   VectorizedStorer<OutputType, nvec, aligned> storer(output, N);
   ComputeType max = 0;
