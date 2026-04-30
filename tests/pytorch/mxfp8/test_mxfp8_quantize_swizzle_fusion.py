@@ -97,6 +97,7 @@ def check_mxfp8_quantize_swizzle_fusion(
         # full tile cases
         (1024, 256),
         # larger sizes
+        (4096, 32768),
         (8192, 1024),
         (16384, 8192),
         (16384, 16384),
