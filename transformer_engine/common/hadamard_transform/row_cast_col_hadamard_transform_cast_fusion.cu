@@ -1016,7 +1016,8 @@ __global__ static void row_col_rht_gemm_device(
 // QA: m x n: col-major
 // SFA: m/16 x n: col-major
 template <bool kEnableStochasticRounding, bool kEnableRHTColQuant, bool kEnableRowQuant, bool kEnableSwizzleSFOutput,
-class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true>
+class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true,
+bool kUseOversizedSmem=false>
 void row_col_rht_gemm_ntt_w_sfc(
     int sequence_length,
     int hidden_size,
@@ -1116,7 +1117,7 @@ void row_col_rht_gemm_ntt_w_sfc(
       (cute::size<0>(cluster_tile_shape) * cute::size<1>(cluster_tile_shape));
 
   // Define the smem layouts (static)
-  // Calculate max pipeline stages based on Blackwell SM100's 232KB shared memory
+  // Calculate max pipeline stages based on the architecture's shared-memory capacity.
   constexpr int SchedulerPipelineStageCount = 6;
   static int constexpr MainloopPipelineBytes = sizeof(typename cutlass::detail::CustomizedPipelineTmaUmmaAsync<
                                                 1,
@@ -1130,12 +1131,14 @@ void row_col_rht_gemm_ntt_w_sfc(
   static int constexpr BTensorBytes = cute::size(mma_shape_B) * sizeof(TB);
   static int constexpr AccPipelineBytes = sizeof(typename cutlass::PipelineUmmaAsync<AccumulatorPipelineStageCount / EpilogueUnrollFactor, Shape<_1, _1, _1>>::SharedStorage);
   static int constexpr TmemBasePtrsBytes = sizeof(uint32_t);
-  static int constexpr kBlackwellSmemSize = 232448; // 232KB in bytes
+  static int constexpr kSmemCapacityBytes =
+      kUseOversizedSmem ? cutlass::arch::sm107_smem_capacity_bytes
+                        : cutlass::arch::sm100_smem_capacity_bytes;
   static int constexpr kBytesPerStage =
     cute::size(mma_shape_A) * sizeof(TA) + MainloopPipelineBytes;
   static int constexpr kReservedBytes = ClcResponseBytes + CLCThrottlePipelineBytes + TmemBasePtrsBytes +
                                     CLCPipelineBytes + TmemDeallocBytes+BTensorBytes + AccPipelineBytes; // Reserve for barriers and other uses
-  static int constexpr kMaxStages = (kBlackwellSmemSize - kReservedBytes) / kBytesPerStage;
+  static int constexpr kMaxStages = (kSmemCapacityBytes - kReservedBytes) / kBytesPerStage;
   auto sP = Int<kMaxStages>{};      // SMEM pipelines
   auto sA = UMMA::tile_to_mma_shape(
     SmemLayoutAtomA{},
@@ -1198,7 +1201,14 @@ void row_col_rht_gemm_ntt_w_sfc(
     kEnableRowQuant,
     kUseFastMath>;
 
-  NVTE_CHECK_CUDA(cudaFuncSetAttribute(*kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  if constexpr (kUseOversizedSmem) {
+    NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+        *kernel_ptr, cudaFuncAttributeSharedMemoryMode,
+        cudaSharedMemoryModeAllowOversizedSharedMemory));
+  } else {
+    NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+        *kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  }
 
   cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_size, stream};
   cutlass::Status status = cutlass::launch_kernel_on_cluster(
@@ -1307,6 +1317,7 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
   }
 
   auto sm_count = transformer_engine::cuda::sm_count();
+  const bool use_oversized_smem = transformer_engine::cuda::sm_arch() == 107;
 
   NVTE_CHECK(n % hadamard_dimension == 0, "row_length must be divisible by hadamard_dimension.");
 
@@ -1321,37 +1332,41 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
   const bool use_swizzle_sf_output = output_.with_gemm_swizzled_scales;
 
   TRANSFORMER_ENGINE_SWITCH_CONDITION(
-      use_stochastic_rounding, kEnableStochasticRounding,
+      use_oversized_smem, kUseOversizedSmem,
       TRANSFORMER_ENGINE_SWITCH_CONDITION(
-          has_columnwise_quant, kEnableRhtColQuant,
+          use_stochastic_rounding, kEnableStochasticRounding,
           TRANSFORMER_ENGINE_SWITCH_CONDITION(
-              has_rowwise_quant, kEnableRowQuant,
+              has_columnwise_quant, kEnableRhtColQuant,
               TRANSFORMER_ENGINE_SWITCH_CONDITION(
-                  use_swizzle_sf_output, kEnableSwizzleSFOutput,
+                  has_rowwise_quant, kEnableRowQuant,
                   TRANSFORMER_ENGINE_SWITCH_CONDITION(
-                      quant_config.use_fast_math, kUseFastMath,
+                      use_swizzle_sf_output, kEnableSwizzleSFOutput,
+                      TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                          quant_config.use_fast_math, kUseFastMath,
 
-                      if constexpr (kEnableRhtColQuant || kEnableRowQuant) {
-                        detail::row_col_rht_gemm_ntt_w_sfc<
-                            kEnableStochasticRounding, kEnableRhtColQuant, kEnableRowQuant,
-                            kEnableSwizzleSFOutput, TA, TB, TD, TSFD, TQA, TSFA, kUseFastMath>(
-                            /*sequence_length=*/m, /*hidden_size=*/n,
-                            /*A=*/reinterpret_cast<TA const *>(input.dptr),
-                            /*B=*/reinterpret_cast<TB const *>(hadamard_matrix.dptr),
-                            /*D=*/reinterpret_cast<TD *>(columnwise_data_ptr),
-                            /*SFD=*/reinterpret_cast<TSFD *>(columnwise_scale_inv_ptr),
-                            /*QA=*/reinterpret_cast<TQA *>(rowwise_data_ptr),
-                            /*SFA=*/reinterpret_cast<TSFA *>(rowwise_scale_inv_ptr),
-                            /*a_global_amax=*/reinterpret_cast<float const *>(rowwise_amax_ptr),
-                            /*d_global_amax=*/reinterpret_cast<float const *>(columnwise_amax_ptr),
-                            /*rng_state=*/rng_state, /*sm_count=*/sm_count,
-                            /*stream=*/stream, /*k_tile_size=*/k_tile_size);
-                      } else {
-                        NVTE_ERROR("Invalid kernel configuration (kEnableRHTColQuant=",
-                                   kEnableRhtColQuant, ", kEnableRowQuant=", kEnableRowQuant, ").");
-                      }
+                          if constexpr (kEnableRhtColQuant || kEnableRowQuant) {
+                            detail::row_col_rht_gemm_ntt_w_sfc<
+                                kEnableStochasticRounding, kEnableRhtColQuant, kEnableRowQuant,
+                                kEnableSwizzleSFOutput, TA, TB, TD, TSFD, TQA, TSFA, kUseFastMath,
+                                kUseOversizedSmem>(
+                                /*sequence_length=*/m, /*hidden_size=*/n,
+                                /*A=*/reinterpret_cast<TA const *>(input.dptr),
+                                /*B=*/reinterpret_cast<TB const *>(hadamard_matrix.dptr),
+                                /*D=*/reinterpret_cast<TD *>(columnwise_data_ptr),
+                                /*SFD=*/reinterpret_cast<TSFD *>(columnwise_scale_inv_ptr),
+                                /*QA=*/reinterpret_cast<TQA *>(rowwise_data_ptr),
+                                /*SFA=*/reinterpret_cast<TSFA *>(rowwise_scale_inv_ptr),
+                                /*a_global_amax=*/reinterpret_cast<float const *>(rowwise_amax_ptr),
+                                /*d_global_amax=*/reinterpret_cast<float const *>(columnwise_amax_ptr),
+                                /*rng_state=*/rng_state, /*sm_count=*/sm_count,
+                                /*stream=*/stream, /*k_tile_size=*/k_tile_size);
+                          } else {
+                            NVTE_ERROR("Invalid kernel configuration (kEnableRHTColQuant=",
+                                       kEnableRhtColQuant, ", kEnableRowQuant=", kEnableRowQuant,
+                                       ").");
+                          }
 
-                  );););););
+                      ););););););
 }
 
 }  // namespace transformer_engine
