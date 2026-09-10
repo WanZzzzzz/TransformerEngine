@@ -22,6 +22,7 @@ from .storage.grouped_tensor_storage import GroupedTensorStorage
 from .storage.hybrid_tensor_storage import HybridQuantizedTensorStorage
 from .float8_tensor import Float8Tensor, Float8Quantizer, Float8CurrentScalingQuantizer
 from .mxfp8_tensor import MXFP8Tensor, MXFP8Quantizer
+from .localized_mxfp8 import MXFP8LocalizedPair, localize_mxfp8_tensor
 from .float8_blockwise_tensor import Float8BlockwiseQTensor, Float8BlockQuantizer
 from .nvfp4_tensor import NVFP4Tensor, NVFP4Quantizer
 from .grouped_tensor import GroupedTensor
@@ -35,6 +36,8 @@ __all__ = [
     "Float8Quantizer",
     "Float8CurrentScalingQuantizer",
     "MXFP8Quantizer",
+    "MXFP8LocalizedPair",
+    "localize_mxfp8_tensor",
     "Float8BlockQuantizer",
     "NVFP4Quantizer",
     "HybridQuantizer",
