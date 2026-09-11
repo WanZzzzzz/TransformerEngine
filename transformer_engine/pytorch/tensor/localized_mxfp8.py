@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Experimental per-locality-domain MXFP8 rowwise quantization."""
+"""Experimental per-locality-domain MXFP8 quantization."""
 
 from __future__ import annotations
 
@@ -102,15 +102,20 @@ class MXFP8LocalizedPair:
             )
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
-        if not quantizer.rowwise_usage or quantizer.columnwise_usage:
+        if not quantizer.rowwise_usage:
             raise ValueError(
-                "MXFP8 localization currently requires rowwise-only quantization"
+                "MXFP8 localization requires rowwise output; columnwise-only is unsupported"
             )
         if quantizer.with_2d_quantization:
             raise ValueError("MXFP8 localization does not support 2D quantization")
         if quantizer.internal:
             raise ValueError(
                 "MXFP8 localization currently requires quantizer.internal=False"
+            )
+        if quantizer.columnwise_usage and quantizer.optimize_for_gemm:
+            raise ValueError(
+                "Bidirectional localization currently requires compact scales; "
+                "GEMM swizzling is not implemented yet"
             )
 
         rows, cols = tensor.shape
@@ -122,9 +127,9 @@ class MXFP8LocalizedPair:
                 "Each input half must satisfy MXFP8 shape alignment "
                 f"(got half shape {(rows_per_domain, cols)})"
             )
-        if cols % 128 != 0:
+        if not quantizer.columnwise_usage and cols % 128 != 0:
             raise ValueError(
-                "The specialized cast-only kernel requires 128-aligned columns "
+                "The specialized rowwise-only kernel requires 128-aligned columns "
                 f"(got {cols})"
             )
         if quantizer.optimize_for_gemm and rows_per_domain % 128 != 0:

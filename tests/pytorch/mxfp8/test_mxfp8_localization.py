@@ -76,20 +76,60 @@ def test_mxfp8_rowwise_localized_pair() -> None:
 @pytest.mark.skipif(
     not _localization_available(), reason="CUDA localization is unavailable"
 )
-@pytest.mark.skipif(
-    os.getenv("RUN_BENCHMARK_TESTS") != "1",
-    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
-)
-def test_mxfp8_rowwise_localized_performance() -> None:
-    """Compare full-chip and two-domain quantization for [4096, 32768]."""
-    shape = (4096, 32768)
-    tensor = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+def test_mxfp8_bidirectional_localized_pair() -> None:
+    """Localized compact rowwise and columnwise outputs must match full-tensor output."""
+    tensor = torch.randn((256, 128), dtype=torch.bfloat16, device="cuda")
     quantizer = te.MXFP8Quantizer(
         fp8_dtype=te.DType.kFloat8E4M3,
         rowwise=True,
-        columnwise=False,
+        columnwise=True,
     )
-    quantizer.optimize_for_gemm = True
+
+    reference = quantizer(tensor)
+    localized = te.localize_mxfp8_tensor(tensor, quantizer)
+    outputs = localized.quantize()
+    torch.cuda.synchronize()
+
+    rows_per_domain = tensor.shape[0] // 2
+    col_scale_rows_per_domain = rows_per_domain // 32
+    for domain, output in enumerate(outputs):
+        row_start = domain * rows_per_domain
+        row_end = row_start + rows_per_domain
+        scale_start = domain * col_scale_rows_per_domain
+        scale_end = scale_start + col_scale_rows_per_domain
+        torch.testing.assert_close(
+            output._rowwise_data,
+            reference._rowwise_data[row_start:row_end],
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._rowwise_scale_inv,
+            reference._rowwise_scale_inv[row_start:row_end],
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._columnwise_data,
+            reference._columnwise_data[row_start:row_end],
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._columnwise_scale_inv,
+            reference._columnwise_scale_inv[scale_start:scale_end],
+            atol=0.0,
+            rtol=0.0,
+        )
+
+
+def _run_localized_performance_comparison(
+    quantizer: te.MXFP8Quantizer,
+    mode: str,
+) -> None:
+    """Compare one full-chip launch with ordinary and localized green launches."""
+    shape = (4096, 32768)
+    tensor = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
 
     baseline_output = quantizer.make_empty(
         shape,
@@ -148,7 +188,7 @@ def test_mxfp8_rowwise_localized_performance() -> None:
     assert green_unlocalized_ms > 0.0
     assert localized_ms > 0.0
     print(
-        f"\nMXFP8 localization {shape}:"
+        f"\nMXFP8 {mode} localization {shape}:"
         f"\n  full-chip single launch:       {baseline_ms:.3f} ms"
         f"\n  two green, ordinary memory:    {green_unlocalized_ms:.3f} ms"
         f"\n  two green, localized memory:   {localized_ms:.3f} ms"
@@ -156,3 +196,38 @@ def test_mxfp8_rowwise_localized_performance() -> None:
         f"\n  memory-locality contribution:  {green_unlocalized_ms / localized_ms:.3f}x"
         f"\n  overall speedup:               {baseline_ms / localized_ms:.3f}x"
     )
+
+
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+@pytest.mark.skipif(
+    os.getenv("RUN_BENCHMARK_TESTS") != "1",
+    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
+)
+def test_mxfp8_rowwise_localized_performance() -> None:
+    """Compare rowwise full-chip and two-domain quantization."""
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+    )
+    quantizer.optimize_for_gemm = True
+    _run_localized_performance_comparison(quantizer, "rowwise")
+
+
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+@pytest.mark.skipif(
+    os.getenv("RUN_BENCHMARK_TESTS") != "1",
+    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
+)
+def test_mxfp8_bidirectional_localized_performance() -> None:
+    """Compare compact bidirectional full-chip and two-domain quantization."""
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+    _run_localized_performance_comparison(quantizer, "bidirectional compact")
