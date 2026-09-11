@@ -58,9 +58,10 @@ def _get_localization_context(device_index: int):
 class MXFP8LocalizedPair:
     """Two independently allocated MXFP8 tensors, one per GPU locality domain.
 
-    This is an eager prototype. Input rows are copied once into persistent,
-    locality-domain-backed tensors. Calls to :meth:`quantize` time only the
-    quantization work; refreshing the localized inputs is a separate operation.
+    Input rows are copied once into persistent, locality-domain-backed tensors.
+    Calls to :meth:`quantize` time only the quantization work; refreshing the
+    localized inputs is a separate operation. The fork/join is CUDA-graph
+    capturable when capture starts on the parent stream.
     """
 
     def __init__(
@@ -222,10 +223,6 @@ class MXFP8LocalizedPair:
         parent_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[MXFP8Tensor, MXFP8Tensor]:
         """Quantize both localized halves concurrently with a fork/join."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MXFP8LocalizedPair currently supports eager execution only"
-            )
         if parent_stream is None:
             parent_stream = torch.cuda.current_stream(self.inputs[0].device)
 

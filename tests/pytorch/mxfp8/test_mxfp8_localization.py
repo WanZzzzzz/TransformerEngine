@@ -28,6 +28,18 @@ def _benchmark_ms(function, warmup: int = 20, iterations: int = 100) -> float:
     return start.elapsed_time(end) / iterations
 
 
+def _capture_cuda_graph(function):
+    """Capture a callable, including any joined side-stream branches."""
+    function()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        function()
+    torch.cuda.synchronize()
+    return graph
+
+
 def _localization_available() -> bool:
     try:
         from torch.cuda.green_contexts import is_localization_supported
@@ -226,17 +238,31 @@ def _run_localized_performance_comparison(
         for event in green_joins:
             parent_stream.wait_event(event)
 
-    baseline_ms = _benchmark_ms(
-        lambda: quantizer.update_quantized(tensor, baseline_output)
-    )
-    green_unlocalized_ms = _benchmark_ms(green_unlocalized_quantize)
-    localized_ms = _benchmark_ms(localized.quantize)
+    def baseline_quantize() -> None:
+        quantizer.update_quantized(tensor, baseline_output)
+
+    use_cuda_graph = os.getenv("MXFP8_LOCALIZATION_USE_CUDA_GRAPH") == "1"
+    if use_cuda_graph:
+        baseline_function = _capture_cuda_graph(baseline_quantize).replay
+        green_unlocalized_function = _capture_cuda_graph(
+            green_unlocalized_quantize
+        ).replay
+        localized_function = _capture_cuda_graph(localized.quantize).replay
+    else:
+        baseline_function = baseline_quantize
+        green_unlocalized_function = green_unlocalized_quantize
+        localized_function = localized.quantize
+
+    baseline_ms = _benchmark_ms(baseline_function)
+    green_unlocalized_ms = _benchmark_ms(green_unlocalized_function)
+    localized_ms = _benchmark_ms(localized_function)
 
     assert baseline_ms > 0.0
     assert green_unlocalized_ms > 0.0
     assert localized_ms > 0.0
+    execution = "CUDA Graph" if use_cuda_graph else "eager"
     print(
-        f"\nMXFP8 {mode} localization {shape}:"
+        f"\nMXFP8 {mode} localization {shape} ({execution}):"
         f"\n  full-chip single launch:       {baseline_ms:.3f} ms"
         f"\n  two green, ordinary memory:    {green_unlocalized_ms:.3f} ms"
         f"\n  two green, localized memory:   {localized_ms:.3f} ms"
