@@ -98,14 +98,61 @@ def test_mxfp8_rowwise_localized_performance() -> None:
     )
     localized = te.localize_mxfp8_tensor(tensor, quantizer)
 
+    # Control: use the same two half-sized green-stream launches as the
+    # localized path, but keep input, output, and scales in ordinary allocations.
+    # Comparing this with localized_ms isolates memory placement from launch
+    # geometry and SM partitioning.
+    rows_per_domain = shape[0] // 2
+    green_unlocalized_inputs = (
+        tensor[:rows_per_domain],
+        tensor[rows_per_domain:],
+    )
+    green_unlocalized_outputs = tuple(
+        quantizer.make_empty(
+            (rows_per_domain, shape[1]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        for _ in range(2)
+    )
+    green_fork = torch.cuda.Event(enable_timing=False)
+    green_joins = (
+        torch.cuda.Event(enable_timing=False),
+        torch.cuda.Event(enable_timing=False),
+    )
+
+    def green_unlocalized_quantize() -> None:
+        parent_stream = torch.cuda.current_stream(tensor.device)
+        green_fork.record(parent_stream)
+        for domain, (input_half, output_half, stream) in enumerate(
+            zip(
+                green_unlocalized_inputs,
+                green_unlocalized_outputs,
+                localized.streams,
+            )
+        ):
+            stream.wait_event(green_fork)
+            with torch.cuda.stream(stream):
+                quantizer.update_quantized(input_half, output_half)
+            green_joins[domain].record(stream)
+        for event in green_joins:
+            parent_stream.wait_event(event)
+
     baseline_ms = _benchmark_ms(
         lambda: quantizer.update_quantized(tensor, baseline_output)
     )
+    green_unlocalized_ms = _benchmark_ms(green_unlocalized_quantize)
     localized_ms = _benchmark_ms(localized.quantize)
 
     assert baseline_ms > 0.0
+    assert green_unlocalized_ms > 0.0
     assert localized_ms > 0.0
     print(
-        f"\nMXFP8 localization {shape}: baseline={baseline_ms:.3f} ms, "
-        f"localized={localized_ms:.3f} ms, speedup={baseline_ms / localized_ms:.3f}x"
+        f"\nMXFP8 localization {shape}:"
+        f"\n  full-chip single launch:       {baseline_ms:.3f} ms"
+        f"\n  two green, ordinary memory:    {green_unlocalized_ms:.3f} ms"
+        f"\n  two green, localized memory:   {localized_ms:.3f} ms"
+        f"\n  launch/partition contribution: {baseline_ms / green_unlocalized_ms:.3f}x"
+        f"\n  memory-locality contribution:  {green_unlocalized_ms / localized_ms:.3f}x"
+        f"\n  overall speedup:               {baseline_ms / localized_ms:.3f}x"
     )
