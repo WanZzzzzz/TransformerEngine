@@ -112,11 +112,6 @@ class MXFP8LocalizedPair:
             raise ValueError(
                 "MXFP8 localization currently requires quantizer.internal=False"
             )
-        if quantizer.columnwise_usage and quantizer.optimize_for_gemm:
-            raise ValueError(
-                "Bidirectional localization currently requires compact scales; "
-                "GEMM swizzling is not implemented yet"
-            )
 
         rows, cols = tensor.shape
         if rows % 2 != 0:

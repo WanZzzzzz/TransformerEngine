@@ -123,6 +123,54 @@ def test_mxfp8_bidirectional_localized_pair() -> None:
         )
 
 
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+def test_mxfp8_bidirectional_swizzled_localized_pair() -> None:
+    """Localized fused-swizzle outputs must match independent half-tensor outputs."""
+    tensor = torch.randn((256, 128), dtype=torch.bfloat16, device="cuda")
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+    quantizer.optimize_for_gemm = True
+
+    localized = te.localize_mxfp8_tensor(tensor, quantizer)
+    outputs = localized.quantize()
+    torch.cuda.synchronize()
+
+    rows_per_domain = tensor.shape[0] // 2
+    for domain, output in enumerate(outputs):
+        row_start = domain * rows_per_domain
+        row_end = row_start + rows_per_domain
+        reference_half = quantizer(tensor[row_start:row_end])
+        torch.testing.assert_close(
+            output._rowwise_data,
+            reference_half._rowwise_data,
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._rowwise_scale_inv,
+            reference_half._rowwise_scale_inv,
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._columnwise_data,
+            reference_half._columnwise_data,
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._columnwise_scale_inv,
+            reference_half._columnwise_scale_inv,
+            atol=0.0,
+            rtol=0.0,
+        )
+
+
 def _run_localized_performance_comparison(
     quantizer: te.MXFP8Quantizer,
     mode: str,
@@ -231,3 +279,21 @@ def test_mxfp8_bidirectional_localized_performance() -> None:
         columnwise=True,
     )
     _run_localized_performance_comparison(quantizer, "bidirectional compact")
+
+
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+@pytest.mark.skipif(
+    os.getenv("RUN_BENCHMARK_TESTS") != "1",
+    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
+)
+def test_mxfp8_bidirectional_swizzled_localized_performance() -> None:
+    """Compare fused-swizzle bidirectional full-chip and two-domain quantization."""
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+    quantizer.optimize_for_gemm = True
+    _run_localized_performance_comparison(quantizer, "bidirectional fused-swizzle")
