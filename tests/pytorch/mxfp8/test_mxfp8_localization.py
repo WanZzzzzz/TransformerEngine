@@ -232,6 +232,10 @@ def test_mxfp8_bidirectional_swizzled_vmm() -> None:
         out_dtype=tensor.dtype,
     )
     torch.testing.assert_close(vmm_gemm, reference_gemm, atol=0.0, rtol=0.0)
+    green_gemm = torch.empty_like(reference_gemm)
+    workspace.quantize_and_gemm(quantized_weight, green_gemm)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(green_gemm, reference_gemm, atol=0.0, rtol=0.0)
     workspace.close()
 
 
@@ -419,6 +423,7 @@ def test_mxfp8_bidirectional_swizzled_vmm_performance() -> None:
         device=tensor.device,
     )
     localized_gemm_output = torch.empty_like(baseline_gemm_output)
+    green_gemm_output = torch.empty_like(baseline_gemm_output)
 
     def baseline_quantize() -> None:
         quantizer.update_quantized(tensor, baseline_output)
@@ -441,27 +446,44 @@ def test_mxfp8_bidirectional_swizzled_vmm_performance() -> None:
             out=localized_gemm_output,
         )
 
+    def green_gemm_pipeline() -> None:
+        workspace.quantize_and_gemm(quantized_weight, green_gemm_output)
+
     use_cuda_graph = os.getenv("MXFP8_LOCALIZATION_USE_CUDA_GRAPH") == "1"
     if use_cuda_graph:
         baseline_function = _capture_cuda_graph(baseline_quantize).replay
         localized_function = _capture_cuda_graph(workspace.quantize).replay
         baseline_pipeline_function = _capture_cuda_graph(baseline_pipeline).replay
         localized_pipeline_function = _capture_cuda_graph(localized_pipeline).replay
+        green_gemm_pipeline_function = _capture_cuda_graph(green_gemm_pipeline).replay
     else:
         baseline_function = baseline_quantize
         localized_function = workspace.quantize
         baseline_pipeline_function = baseline_pipeline
         localized_pipeline_function = localized_pipeline
+        green_gemm_pipeline_function = green_gemm_pipeline
 
     baseline_ms = _benchmark_ms(baseline_function)
     localized_ms = _benchmark_ms(localized_function)
     baseline_pipeline_ms = _benchmark_ms(baseline_pipeline_function)
     localized_pipeline_ms = _benchmark_ms(localized_pipeline_function)
-    baseline_pipeline()
-    localized_pipeline()
+    green_gemm_pipeline_ms = _benchmark_ms(green_gemm_pipeline_function)
+
+    # Use new input values to catch a graph replay that incorrectly consumes a
+    # quantized partition from the preceding replay.
+    tensor.normal_()
+    baseline_pipeline_function()
+    localized_pipeline_function()
+    green_gemm_pipeline_function()
     torch.cuda.synchronize()
     torch.testing.assert_close(
         localized_gemm_output,
+        baseline_gemm_output,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        green_gemm_output,
         baseline_gemm_output,
         atol=0.0,
         rtol=0.0,
@@ -477,5 +499,8 @@ def test_mxfp8_bidirectional_swizzled_vmm_performance() -> None:
         f"\n  localized output + GEMM:      {localized_pipeline_ms:.3f} ms"
         f"\n  quant + GEMM speedup:         "
         f"{baseline_pipeline_ms / localized_pipeline_ms:.3f}x"
+        f"\n  localized quant + green GEMM: {green_gemm_pipeline_ms:.3f} ms"
+        f"\n  end-to-end green speedup:      "
+        f"{baseline_pipeline_ms / green_gemm_pipeline_ms:.3f}x"
     )
     workspace.close()

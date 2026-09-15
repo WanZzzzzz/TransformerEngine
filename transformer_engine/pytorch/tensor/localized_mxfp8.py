@@ -264,6 +264,7 @@ class MXFP8VMMWorkspace:
         partition_outputs: Tuple[MXFP8Tensor, MXFP8Tensor],
         quantizer: MXFP8Quantizer,
         allocator: VMMRowSplitAllocator,
+        mempools: Tuple[object, object],
         streams: Tuple[torch.cuda.Stream, torch.cuda.Stream],
     ) -> None:
         self.input = input_tensor
@@ -271,7 +272,9 @@ class MXFP8VMMWorkspace:
         self.partition_outputs = partition_outputs
         self.quantizer = quantizer
         self.allocator = allocator
+        self.mempools = mempools
         self.streams = streams
+        self._gemm_workspaces: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._fork_event = torch.cuda.Event(enable_timing=False)
         self._join_events = tuple(
             torch.cuda.Event(enable_timing=False) for _ in range(2)
@@ -312,7 +315,7 @@ class MXFP8VMMWorkspace:
             torch.cuda.current_device() if device.index is None else device.index
         )
         device = torch.device("cuda", device_index)
-        _, _, streams = _get_localization_context(device_index)
+        _, mempools, streams = _get_localization_context(device_index)
         allocator = VMMRowSplitAllocator(device)
 
         if input_tensor is None:
@@ -386,6 +389,7 @@ class MXFP8VMMWorkspace:
             partition_outputs=tuple(partition_outputs),
             quantizer=quantizer,
             allocator=allocator,
+            mempools=mempools,
             streams=streams,
         )
 
@@ -491,8 +495,111 @@ class MXFP8VMMWorkspace:
             parent_stream.wait_event(event)
         return self.output
 
+    def _get_gemm_workspaces(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Lazily allocate independent locality-backed cuBLAS workspaces."""
+        if self._gemm_workspaces is None:
+            from transformer_engine.pytorch.cpp_extensions.gemm import (
+                get_cublas_workspace_size_bytes,
+            )
+
+            workspaces = []
+            workspace_size = get_cublas_workspace_size_bytes()
+            for mempool, stream in zip(self.mempools, self.streams):
+                with torch.cuda.use_mem_pool(mempool):
+                    with torch.cuda.stream(stream):
+                        workspaces.append(
+                            torch.empty(
+                                workspace_size,
+                                dtype=torch.uint8,
+                                device=self.input.device,
+                            )
+                        )
+            self._gemm_workspaces = tuple(workspaces)
+        return self._gemm_workspaces
+
+    def quantize_and_gemm(
+        self,
+        weight: MXFP8Tensor,
+        output: torch.Tensor,
+        parent_stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        """Quantize and GEMM each row partition on its green-context stream.
+
+        The activation data and cuBLAS workspace are locality-backed. Weight,
+        scale, and GEMM output allocations are ordinary memory.
+        """
+        if not isinstance(weight, MXFP8Tensor):
+            raise TypeError(f"Expected an MXFP8Tensor weight, got {type(weight)}")
+        if output.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D GEMM output, got shape {tuple(output.shape)}"
+            )
+        if weight._rowwise_data is None or weight._rowwise_scale_inv is None:
+            raise ValueError(
+                "Localized GEMM requires rowwise MXFP8 weight data and scales"
+            )
+        expected_weight_shape = (output.shape[1], self.input.shape[1])
+        if tuple(weight.shape) != expected_weight_shape:
+            raise ValueError(
+                f"Expected weight shape {expected_weight_shape}, got {tuple(weight.shape)}"
+            )
+        expected_output_shape = (self.input.shape[0], weight.shape[0])
+        if (
+            tuple(output.shape) != expected_output_shape
+            or output.device != self.input.device
+            or output.dtype != self.input.dtype
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "GEMM output must match the expected shape, input dtype/device, "
+                "and contiguous layout"
+            )
+        if parent_stream is None:
+            parent_stream = torch.cuda.current_stream(self.input.device)
+
+        from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+        gemm_workspaces = self._get_gemm_workspaces()
+        fork_event, join_events = self._fork_join_events()
+        fork_event.record(parent_stream)
+        for stream in self.streams:
+            stream.wait_event(fork_event)
+            self.input.record_stream(stream)
+            output.record_stream(stream)
+            weight._rowwise_data.record_stream(stream)
+            weight._rowwise_scale_inv.record_stream(stream)
+
+        rows_per_domain = self.input.shape[0] // 2
+        for domain, (quantized_output, stream, gemm_workspace) in enumerate(
+            zip(self.partition_outputs, self.streams, gemm_workspaces)
+        ):
+            row_start = domain * rows_per_domain
+            row_end = row_start + rows_per_domain
+            with torch.cuda.stream(stream):
+                tex.quantize_mxfp8_row_partition(
+                    self.input[row_start:row_end],
+                    self.quantizer,
+                    quantized_output,
+                    row_start,
+                    self.input.shape[0],
+                )
+                general_gemm(
+                    weight,
+                    quantized_output,
+                    out_dtype=output.dtype,
+                    out=output[row_start:row_end],
+                    workspace=gemm_workspace,
+                )
+
+        for event, stream in zip(join_events, self.streams):
+            event.record(stream)
+        for event in join_events:
+            parent_stream.wait_event(event)
+        return output
+
     def close(self) -> None:
         """Release VMM mappings after all users of the workspace are done."""
+        self._gemm_workspaces = None
         self.allocator.close()
 
 

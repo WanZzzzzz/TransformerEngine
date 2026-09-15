@@ -23,11 +23,15 @@ Two green-context streams quantize the partitions concurrently:
 3. Each stream reads its ordinary-memory input partition and writes its
    locality-backed output partition.
 4. The parent stream waits for both completion events.
-5. An unchanged full-chip GEMM consumes the single MXFP8 tensor directly.
+5. Either an unchanged full-chip GEMM consumes the single MXFP8 tensor, or
+   each green stream immediately runs GEMM on its local activation partition.
+6. The parent stream joins both partitioned GEMMs before consuming the ordinary
+   contiguous output tensor.
 
-There is no explicit copy and no split GEMM. Input reads are not localized, so
-this intentionally measures the benefit available from localized output writes
-and two-domain execution when the producer cannot supply localized memory.
+There is no explicit copy. Input reads by quantization are not localized. In
+the partitioned-GEMM variant, activation reads and independent cuBLAS
+workspaces are localized, while weight reads and GEMM output writes use
+ordinary allocations.
 
 Example
 -------
@@ -57,6 +61,9 @@ Example
        out=output,
    )
 
+   # Or keep quantization and its row-partition GEMM on each green stream.
+   workspace.quantize_and_gemm(quantized_weight, output)
+
 CUDA Graph capture
 ------------------
 
@@ -83,6 +90,8 @@ Prototype limitations
 
 * Exactly two locality domains and equal, aligned row partitions.
 * Bidirectional MXFP8 with fused GEMM scale swizzling only.
-* Ordinary input allocation; only MXFP8 data outputs are VMM-localized.
+* Ordinary quantization input and GEMM output allocations.
+* GEMM is split across output rows; activation inputs and cuBLAS workspaces are
+  localized, but the shared weight is not.
 * Scale buffers remain ordinary allocations.
 * Explicit workspace lifetime management is required.

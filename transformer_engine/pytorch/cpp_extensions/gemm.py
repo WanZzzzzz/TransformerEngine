@@ -208,6 +208,7 @@ def general_gemm(
     ub_type: tex.CommOverlapType = None,
     extra_output: Optional[torch.Tensor] = None,
     bulk_overlap: bool = False,
+    workspace: Optional[torch.Tensor] = None,
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
 
@@ -225,7 +226,8 @@ def general_gemm(
 
     alpha = validate_gemm_scale(alpha, True)
     beta = validate_gemm_scale(beta, accumulate)
-    workspace = get_cublas_workspace(A.device.index, ub is not None, False)
+    if workspace is None:
+        workspace = get_cublas_workspace(A.device.index, ub is not None, False)
 
     if ub_type is not None:
         assert ub is not None, (
