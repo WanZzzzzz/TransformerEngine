@@ -235,7 +235,9 @@ def test_mxfp8_bidirectional_swizzled_vmm() -> None:
     green_gemm = torch.empty_like(reference_gemm)
     workspace.quantize_and_gemm(quantized_weight, green_gemm)
     torch.cuda.synchronize()
-    torch.testing.assert_close(green_gemm, reference_gemm, atol=0.0, rtol=0.0)
+    # Splitting M changes the cuBLASLt problem shape and may select a different
+    # split-K reduction order, so the BF16 result is not bitwise deterministic.
+    torch.testing.assert_close(green_gemm, reference_gemm, atol=2.0, rtol=0.02)
     workspace.close()
 
 
@@ -485,8 +487,8 @@ def test_mxfp8_bidirectional_swizzled_vmm_performance() -> None:
     torch.testing.assert_close(
         green_gemm_output,
         baseline_gemm_output,
-        atol=0.0,
-        rtol=0.0,
+        atol=2.0,
+        rtol=0.02,
     )
     execution = "CUDA Graph" if use_cuda_graph else "eager"
     print(
