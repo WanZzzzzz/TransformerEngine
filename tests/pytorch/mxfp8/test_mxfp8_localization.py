@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import transformer_engine.pytorch as te
+from transformer_engine.pytorch.cpp_extensions import general_gemm
 
 
 def _benchmark_ms(function, warmup: int = 20, iterations: int = 100) -> float:
@@ -183,6 +184,57 @@ def test_mxfp8_bidirectional_swizzled_localized_pair() -> None:
         )
 
 
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+def test_mxfp8_bidirectional_swizzled_vmm() -> None:
+    """Two slab launches must produce one full GEMM-swizzled MXFP8 tensor."""
+    shape = (256, 32768)
+    tensor = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+    quantizer.optimize_for_gemm = True
+    reference = quantizer(tensor)
+
+    try:
+        workspace = te.localize_mxfp8_output_vmm(tensor, quantizer)
+    except (ImportError, RuntimeError, ValueError) as exc:
+        pytest.skip(f"VMM localization is unavailable: {exc}")
+    output = workspace.quantize()
+    torch.cuda.synchronize()
+
+    for name in (
+        "_rowwise_data",
+        "_rowwise_scale_inv",
+        "_columnwise_data",
+        "_columnwise_scale_inv",
+    ):
+        torch.testing.assert_close(
+            getattr(output, name),
+            getattr(reference, name),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    weight = torch.randn((128, shape[1]), dtype=tensor.dtype, device=tensor.device)
+    quantized_weight = quantizer(weight)
+    reference_gemm, *_ = general_gemm(
+        quantized_weight,
+        reference,
+        out_dtype=tensor.dtype,
+    )
+    vmm_gemm, *_ = general_gemm(
+        quantized_weight,
+        output,
+        out_dtype=tensor.dtype,
+    )
+    torch.testing.assert_close(vmm_gemm, reference_gemm, atol=0.0, rtol=0.0)
+    workspace.close()
+
+
 def _run_localized_performance_comparison(
     quantizer: te.MXFP8Quantizer,
     mode: str,
@@ -323,3 +375,107 @@ def test_mxfp8_bidirectional_swizzled_localized_performance() -> None:
     )
     quantizer.optimize_for_gemm = True
     _run_localized_performance_comparison(quantizer, "bidirectional fused-swizzle")
+
+
+@pytest.mark.skipif(
+    not _localization_available(), reason="CUDA localization is unavailable"
+)
+@pytest.mark.skipif(
+    os.getenv("RUN_BENCHMARK_TESTS") != "1",
+    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
+)
+def test_mxfp8_bidirectional_swizzled_vmm_performance() -> None:
+    """Compare quant and quant+small-GEMM with VMM-localized MXFP8 output."""
+    shape = (4096, 32768)
+    tensor = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    quantizer = te.MXFP8Quantizer(
+        fp8_dtype=te.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+    quantizer.optimize_for_gemm = True
+    baseline_output = quantizer.make_empty(
+        shape,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    try:
+        workspace = te.localize_mxfp8_output_vmm(tensor, quantizer)
+    except (ImportError, RuntimeError, ValueError) as exc:
+        pytest.skip(f"VMM localization is unavailable: {exc}")
+
+    gemm_n = int(os.getenv("MXFP8_LOCALIZATION_GEMM_N", "256"))
+    if gemm_n % 128 != 0:
+        raise ValueError(f"MXFP8_LOCALIZATION_GEMM_N must be 128-aligned, got {gemm_n}")
+    weight = torch.randn(
+        (gemm_n, shape[1]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    quantized_weight = quantizer(weight)
+    baseline_gemm_output = torch.empty(
+        (shape[0], gemm_n),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    localized_gemm_output = torch.empty_like(baseline_gemm_output)
+
+    def baseline_quantize() -> None:
+        quantizer.update_quantized(tensor, baseline_output)
+
+    def baseline_pipeline() -> None:
+        baseline_quantize()
+        general_gemm(
+            quantized_weight,
+            baseline_output,
+            out_dtype=tensor.dtype,
+            out=baseline_gemm_output,
+        )
+
+    def localized_pipeline() -> None:
+        workspace.quantize()
+        general_gemm(
+            quantized_weight,
+            workspace.output,
+            out_dtype=tensor.dtype,
+            out=localized_gemm_output,
+        )
+
+    use_cuda_graph = os.getenv("MXFP8_LOCALIZATION_USE_CUDA_GRAPH") == "1"
+    if use_cuda_graph:
+        baseline_function = _capture_cuda_graph(baseline_quantize).replay
+        localized_function = _capture_cuda_graph(workspace.quantize).replay
+        baseline_pipeline_function = _capture_cuda_graph(baseline_pipeline).replay
+        localized_pipeline_function = _capture_cuda_graph(localized_pipeline).replay
+    else:
+        baseline_function = baseline_quantize
+        localized_function = workspace.quantize
+        baseline_pipeline_function = baseline_pipeline
+        localized_pipeline_function = localized_pipeline
+
+    baseline_ms = _benchmark_ms(baseline_function)
+    localized_ms = _benchmark_ms(localized_function)
+    baseline_pipeline_ms = _benchmark_ms(baseline_pipeline_function)
+    localized_pipeline_ms = _benchmark_ms(localized_pipeline_function)
+    baseline_pipeline()
+    localized_pipeline()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        localized_gemm_output,
+        baseline_gemm_output,
+        atol=0.0,
+        rtol=0.0,
+    )
+    execution = "CUDA Graph" if use_cuda_graph else "eager"
+    print(
+        f"\nMXFP8 ordinary-input/VMM-output {shape} ({execution}):"
+        f"\n  GEMM N:                       {gemm_n}"
+        f"\n  full-chip quant:              {baseline_ms:.3f} ms"
+        f"\n  localized-output quant:       {localized_ms:.3f} ms"
+        f"\n  quant speedup:                {baseline_ms / localized_ms:.3f}x"
+        f"\n  full-chip quant + GEMM:       {baseline_pipeline_ms:.3f} ms"
+        f"\n  localized output + GEMM:      {localized_pipeline_ms:.3f} ms"
+        f"\n  quant + GEMM speedup:         "
+        f"{baseline_pipeline_ms / localized_pipeline_ms:.3f}x"
+    )
+    workspace.close()
