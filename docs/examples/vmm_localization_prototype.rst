@@ -33,6 +33,30 @@ the partitioned-GEMM variant, activation reads and independent cuBLAS
 workspaces are localized, while weight reads and GEMM output writes use
 ordinary allocations.
 
+Producer-output experiment
+--------------------------
+
+For a known producer with an ``out=`` interface, allocate the workspace input
+up front and write the producer result directly into it:
+
+.. code-block:: python
+
+   workspace = te.MXFP8VMMWorkspace.empty(
+       x.shape,
+       dtype=x.dtype,
+       device=x.device,
+       quantizer=quantizer,
+   )
+   torch.add(x, residual, out=workspace.input)
+   workspace.quantize()
+
+This avoids an explicit localization copy. It is a focused benchmark interface:
+PyTorch operations with ``out=`` do not participate in ordinary autograd
+recording. Megatron's fused MLA rotary-KV function likewise accepts optional
+persistent ``out_key`` and ``out_value`` tensors, which may be VMM allocations.
+The rotary-Q kernel is in-place and therefore inherits the q-up GEMM output
+allocation.
+
 Example
 -------
 
@@ -84,6 +108,11 @@ Focused validation
    MXFP8_LOCALIZATION_GEMM_N=256 \
    pytest -q -s tests/pytorch/mxfp8/test_mxfp8_localization.py \
      -k bidirectional_swizzled_vmm_performance
+
+   RUN_BENCHMARK_TESTS=1 \
+   MXFP8_LOCALIZATION_USE_CUDA_GRAPH=1 \
+   pytest -q -s tests/pytorch/mxfp8/test_mxfp8_localization.py \
+     -k vmm_add_producer_performance
 
 Prototype limitations
 ---------------------
